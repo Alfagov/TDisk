@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, TrashDialog};
 use crate::filesystem::Progress;
 use number_prefix::NumberPrefix;
 use ratatui::Frame;
@@ -59,6 +59,9 @@ pub fn draw(f: &mut Frame, app: &mut App, progress: &Progress) {
     if app.show_help {
         draw_help(f, app, sections[0]);
     }
+    if app.trash_dialog.is_some() {
+        draw_trash_dialog(f, app, sections[0]);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, progress: &Progress, area: Rect) {
@@ -88,8 +91,13 @@ fn draw_header(f: &mut Frame, app: &App, progress: &Progress, area: Rect) {
             "READY",
             ACCENT,
             format!(
-                "{} file allocation · {} items",
+                "{} {} · {} items",
                 format_size(node.map_or(0, |n| n.size)),
+                if app.totals_stale {
+                    "snapshot allocation"
+                } else {
+                    "file allocation"
+                },
                 app.order.len()
             ),
         )
@@ -304,7 +312,9 @@ fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_selection(f: &mut Frame, app: &App, area: Rect) {
-    let text = if let Some(error) = &app.error {
+    let text = if let Some(status) = &app.trash_status {
+        format!(" {status}")
+    } else if let Some(error) = &app.error {
         format!(" Scan error · {error}")
     } else if let Some(node) = app.selected_node()
         && let Some(reason) = node.skip_reason
@@ -340,7 +350,18 @@ fn draw_selection(f: &mut Frame, app: &App, area: Rect) {
 
 fn command_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let enabled = !app.order.is_empty();
-    let commands = if app.show_help {
+    let commands = if app.trashing {
+        vec![("…", "Moving to Trash", false)]
+    } else if let Some(dialog) = &app.trash_dialog {
+        match dialog {
+            TrashDialog::Confirm(_) => vec![
+                ("Esc/n", "Cancel", true),
+                ("↑↓", "Read", true),
+                ("y", "Trash", app.trash_confirmation_visible),
+            ],
+            TrashDialog::Notice(_) => vec![("Esc/↵", "Close", true), ("↑↓", "Read", true)],
+        }
+    } else if app.show_help {
         vec![
             ("Esc", "Close help", true),
             ("↑↓", "Scroll", true),
@@ -353,6 +374,8 @@ fn command_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             ("↑↓", "Move", enabled),
             ("↵", "Open", app.can_open()),
             ("Esc", "Back", app.can_go_up()),
+            ("d", "Trash", app.can_trash()),
+            ("R", "Rescan", !app.scanning),
         ]
     } else {
         vec![
@@ -362,6 +385,8 @@ fn command_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             ("PgUp/Dn", "Page", enabled),
             ("Home/End", "Jump", enabled),
             ("r", "Root", app.can_go_up()),
+            ("d/Del", "Trash", app.can_trash()),
+            ("R", "Rescan", !app.scanning),
             ("?", "Help", true),
             ("q", "Quit", true),
         ]
@@ -402,6 +427,8 @@ const HELP: &[(&str, &str)] = &[
     ("Page Up / Page Down", "Move one screen"),
     ("Home / End", "Jump to first / last item"),
     ("r", "Return to the scan root"),
+    ("d / Delete", "Move selected item to Trash"),
+    ("R (Shift+r)", "Rescan from the original root"),
     ("? / F1", "Toggle this help"),
     ("q / Ctrl+C", "Quit TDisk"),
 ];
@@ -446,6 +473,10 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from("Folders end with /. Files are not opened."),
         Line::from("≥ = still scanning   * = incomplete size"),
         Line::from("Sizes update while you browse."),
+        Line::from("Trash: warning first; y confirms, Esc cancels."),
+        Line::from("System/common folders are protected."),
+        Line::from("Trash is available after scanning (macOS)."),
+        Line::from("Restore trashed items using Finder."),
         Line::default(),
         Line::from(Span::styled(
             "Esc closes help · ↑↓ scroll · q quits",
@@ -453,23 +484,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
         )),
     ]);
     // Wrap explicitly so scroll limits stay correct even on a narrow terminal.
-    let mut wrapped = Vec::new();
-    for line in lines {
-        let mut spans = Vec::new();
-        let mut used = 0;
-        for span in line.spans {
-            for ch in span.content.chars() {
-                let cells = ch.width().unwrap_or(0);
-                if used > 0 && used + cells > inner.width as usize {
-                    wrapped.push(Line::from(std::mem::take(&mut spans)));
-                    used = 0;
-                }
-                spans.push(Span::styled(ch.to_string(), span.style));
-                used += cells;
-            }
-        }
-        wrapped.push(Line::from(spans));
-    }
+    let wrapped = wrap_lines(lines, inner.width);
     app.help_max_scroll = wrapped
         .len()
         .saturating_sub(inner.height as usize)
@@ -479,6 +494,123 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(
         Paragraph::new(wrapped)
             .scroll((app.help_scroll, 0))
+            .block(block),
+        popup,
+    );
+}
+
+fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let mut wrapped = Vec::new();
+    for line in lines {
+        let mut spans = Vec::new();
+        let mut used = 0;
+        for span in line.spans {
+            for ch in span.content.chars() {
+                let cells = ch.width().unwrap_or(0);
+                if used > 0 && used + cells > width as usize {
+                    wrapped.push(Line::from(std::mem::take(&mut spans)));
+                    used = 0;
+                }
+                spans.push(Span::styled(ch.to_string(), span.style));
+                used += cells;
+            }
+        }
+        wrapped.push(Line::from(spans));
+    }
+    wrapped
+}
+
+fn draw_trash_dialog(f: &mut Frame, app: &mut App, area: Rect) {
+    let width = area.width.min(78);
+    let height = area.height.min(22);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let Some(dialog) = &app.trash_dialog else {
+        return;
+    };
+    let (title, lines) = match dialog {
+        TrashDialog::Confirm(candidate) => {
+            let path: String = candidate
+                .path
+                .to_string_lossy()
+                .chars()
+                .map(|ch| if ch.is_control() { '�' } else { ch })
+                .collect();
+            (
+                " Move to Trash? ",
+                vec![
+                    Line::from(Span::styled(
+                        "Move this item and all its contents to Trash?",
+                        Style::default().fg(WARNING).bold(),
+                    )),
+                    Line::default(),
+                    Line::from(path),
+                    Line::default(),
+                    Line::from(format!(
+                        "Scanned allocation: {}{}",
+                        format_size(candidate.size),
+                        if candidate.incomplete {
+                            " (incomplete)"
+                        } else {
+                            ""
+                        }
+                    )),
+                    Line::default(),
+                    Line::from("The original location will no longer contain this item."),
+                    Line::from("Restore it from Trash in Finder if you change your mind."),
+                    Line::from("Disk space may not be freed until Trash is emptied."),
+                    Line::from("TDisk never falls back to permanent deletion."),
+                    Line::default(),
+                    Line::from(Span::styled(
+                        "Press y to Move to Trash. Esc or n cancels.",
+                        Style::default().fg(WARNING).bold(),
+                    )),
+                    Line::from("Enter does not confirm. Scroll to read the full warning."),
+                ],
+            )
+        }
+        TrashDialog::Notice(message) => (
+            " Move to Trash unavailable ",
+            vec![
+                Line::from(Span::styled(
+                    "Move to Trash was not completed.",
+                    Style::default().fg(WARNING).bold(),
+                )),
+                Line::default(),
+                Line::from(
+                    message
+                        .chars()
+                        .map(|ch| if ch.is_control() { '�' } else { ch })
+                        .collect::<String>(),
+                ),
+                Line::default(),
+                Line::from("Esc or Enter closes this message."),
+            ],
+        ),
+    };
+    let block = panel(Line::from(Span::styled(
+        title,
+        Style::default().fg(WARNING).bold(),
+    )));
+    let inner = block.inner(popup);
+    let wrapped = wrap_lines(lines, inner.width);
+    app.trash_dialog_max_scroll = wrapped
+        .len()
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    app.trash_dialog_scroll = app.trash_dialog_scroll.min(app.trash_dialog_max_scroll);
+    app.trash_confirmation_visible = matches!(app.trash_dialog, Some(TrashDialog::Confirm(_)))
+        && inner.width >= 16
+        && inner.height >= 3
+        && app.trash_dialog_scroll == app.trash_dialog_max_scroll;
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(wrapped)
+            .scroll((app.trash_dialog_scroll, 0))
             .block(block),
         popup,
     );
@@ -679,6 +811,33 @@ mod tests {
                 let fitted = fit_name(name, width);
                 assert!(fitted.width() <= width);
                 assert!(!fitted.contains('\n'));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn trash_warning_requires_visible_content_and_tiny_windows_remain_safe() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (width, height) in [(90, 28), (24, 14), (10, 8), (0, 0)] {
+            let (_fixture, mut app) = crate::app::trash_tests::fixture_app();
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut app, &Progress::default()))
+                .unwrap();
+            if width == 90 {
+                assert!(screen(&terminal).contains("never falls back to permanent deletion"));
+                assert!(app.trash_confirmation_visible);
+            } else {
+                assert!(!app.trash_confirmation_visible);
+                app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+                assert!(app.take_trash_request().is_none());
+                app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+                terminal
+                    .draw(|frame| draw(frame, &mut app, &Progress::default()))
+                    .unwrap();
+                assert_eq!(app.trash_confirmation_visible, width == 24);
             }
         }
     }

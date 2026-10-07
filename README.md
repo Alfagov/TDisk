@@ -18,10 +18,26 @@ The command bar stays at the bottom. Highlighted key labels show the main shortc
 | Page Up / Page Down | Move one visible page |
 | Home / End | First / last item |
 | r | Return to the original scan root |
+| d / Delete | Move the selected file or folder to Trash (macOS) |
+| R (Shift+r) | Rescan from the original root after scanning finishes |
 | ? / F1 | Toggle help |
 | q / Ctrl+C | Quit |
 
 While help is open, Esc closes it and navigation keys scroll the help text. Esc at the scan root does nothing; quitting is always explicit. Going back restores the selected folder and previous scroll position.
+
+## Moving items to Trash
+
+After scanning finishes, select an ordinary file or folder and press **d** or **Delete**. A warning shows the full resolved path, scanned allocation, and that a folder's contents move with it. Press **y** to confirm, or **Esc/n** to cancel. Enter and repeated keys never confirm. In a small terminal, scroll the warning with arrows/Page Up/Page Down/End before confirmation becomes available.
+
+TDisk uses macOS's native Move to Trash API. There is **no permanent-delete fallback**, administrator prompt, or Empty Trash command. Restore items using Finder. Moving an item to Trash usually does not free space on its volume until Trash is emptied.
+
+The scan root and its parents, mounted-volume roots, folders containing mounts, system trees (`/System`, `/Library`, `/usr`, `/bin`, `/sbin`, `/dev`, `/etc`, `/var`, `/private/etc`, `/private/var`), and top-level containers such as `/Users`, `/Applications`, `/Volumes`, `/private`, `/tmp`, `/opt`, and `/cores` are blocked. Home folders and standard containers (Desktop, Documents, Downloads, Pictures, Music, Movies, Public, Applications) are protected themselves; ordinary items inside them remain eligible. User Library and Trash trees are protected recursively. Startup Data-volume aliases follow the same rules. Symlinks, pending entries, and excluded entries are not eligible.
+
+The app rechecks the selected item's filesystem identity, scan boundaries, protections, and mount inventory immediately before calling macOS. Permission failures keep the results intact and show an error. Navigation is held only while a move is in progress, so the result applies to the same selected location.
+
+Successful moves remove the row and update its ancestor allocations. Remaining sizes are labeled as a snapshot because hard-link attribution and external changes may require a new scan. Press **R** to rebuild sizes from the original root; this returns navigation to the root. Volume usage is refreshed independently and is never reduced by an assumed amount “freed.” Move to Trash is currently unavailable on other operating systems.
+
+The [macOS design](design/TDisk-macOS-design.md) specifies the matching native UI flow. The Xcode starter has not been implemented.
 
 Folders end with `/`. Files are displayed for inspection and are not opened. The selected row has both a highlight and a `›` marker. The item counter shows your position in the list. `scanning…` means a folder size is pending; `≥` shows the allocated bytes found so far while scanning continues; `*` marks an incomplete size. Percentages use the currently known total and may change during scanning.
 
@@ -50,4 +66,3 @@ cargo test --offline
 cargo clippy --offline --all-targets -- -D warnings
 cargo run --release -- --benchmark /path/to/directory
 ```
-

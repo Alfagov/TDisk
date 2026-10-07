@@ -1,4 +1,5 @@
 mod app;
+mod deletion;
 mod filesystem;
 #[cfg(target_os = "macos")]
 mod fs_mac;
@@ -40,8 +41,8 @@ fn main() -> io::Result<()> {
         return benchmark_scan(path);
     }
 
-    let (tx, rx) = mpsc::channel();
-    let progress = Arc::new(Progress::default());
+    let (tx, mut rx) = mpsc::channel();
+    let mut progress = Arc::new(Progress::default());
     let worker_progress = Arc::clone(&progress);
     let worker_path = path.clone();
     // Start I/O before terminal setup, and immediately publish root entries once enumerated.
@@ -51,8 +52,17 @@ fn main() -> io::Result<()> {
     execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = app::App::new(path);
+    let (trash_tx, trash_rx) = mpsc::channel();
     let mut dirty = true;
     loop {
+        if let Ok(result) = trash_rx.try_recv() {
+            app.finish_trash(result);
+            #[cfg(target_os = "macos")]
+            if let Ok(usage) = fs_mac::volume_usage(&app.root_path) {
+                app.volume_usage = Some(usage);
+            }
+            dirty = true;
+        }
         // Drain queued results before drawing to avoid an extra frame of latency.
         loop {
             match rx.try_recv() {
@@ -82,6 +92,23 @@ fn main() -> io::Result<()> {
                 Event::Key(key) => {
                     if app.handle_key(key) {
                         break;
+                    }
+                    if let Some(candidate) = app.take_trash_request() {
+                        let tx = trash_tx.clone();
+                        thread::spawn(move || {
+                            let result = std::panic::catch_unwind(|| candidate.move_to_trash())
+                                .unwrap_or_else(|_| Err("Move to Trash failed unexpectedly. Check the item in Finder before retrying.".into()));
+                            let _ = tx.send(result);
+                        });
+                    }
+                    if app.take_rescan_request() {
+                        app.reset_for_rescan();
+                        let (tx, new_rx) = mpsc::channel();
+                        rx = new_rx;
+                        progress = Arc::new(Progress::default());
+                        let worker_progress = Arc::clone(&progress);
+                        let worker_path = app.root_path.clone();
+                        thread::spawn(move || filesystem::scan(worker_path, &tx, &worker_progress));
                     }
                     dirty = true;
                 }

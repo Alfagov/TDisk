@@ -1,7 +1,13 @@
+use crate::deletion::{self, TrashCandidate};
 use crate::filesystem::{FileNode, Progress, ScanEvent, VolumeUsage};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+
+pub enum TrashDialog {
+    Confirm(TrashCandidate),
+    Notice(String),
+}
 
 pub struct App {
     pub root: Option<FileNode>,
@@ -18,6 +24,16 @@ pub struct App {
     pub help_scroll: u16,
     pub help_max_scroll: u16,
     pub page_height: usize,
+    pub trash_dialog: Option<TrashDialog>,
+    pub trash_dialog_scroll: u16,
+    pub trash_dialog_max_scroll: u16,
+    pub trash_confirmation_visible: bool,
+    pub trashing: bool,
+    pub trash_status: Option<String>,
+    pub totals_stale: bool,
+    trash_request: Option<TrashCandidate>,
+    trash_index: Option<usize>,
+    rescan_requested: bool,
     view_dirty: bool,
 }
 
@@ -38,6 +54,16 @@ impl App {
             help_scroll: 0,
             help_max_scroll: 0,
             page_height: 1,
+            trash_dialog: None,
+            trash_dialog_scroll: 0,
+            trash_dialog_max_scroll: 0,
+            trash_confirmation_visible: false,
+            trashing: false,
+            trash_status: None,
+            totals_stale: false,
+            trash_request: None,
+            trash_index: None,
+            rescan_requested: false,
             view_dirty: false,
         }
     }
@@ -59,12 +85,14 @@ impl App {
             }
             ScanEvent::Finished => {
                 self.scanning = false;
+                self.trash_status = None;
                 if let Some(root) = &mut self.root {
                     root.pending = false;
                 }
             }
             ScanEvent::Failed(message) => {
                 self.scanning = false;
+                self.trash_status = None;
                 self.error = Some(message);
             }
         }
@@ -112,6 +140,96 @@ impl App {
         self.selected_node().is_some_and(|node| node.is_dir)
     }
 
+    pub fn can_trash(&self) -> bool {
+        cfg!(target_os = "macos")
+            && !self.scanning
+            && !self.trashing
+            && self
+                .selected_node()
+                .is_some_and(|node| !node.pending && node.skip_reason.is_none())
+    }
+
+    fn request_trash(&mut self) {
+        let result = if self.scanning {
+            Err("Wait for scanning to finish before moving an item to Trash.".into())
+        } else if let Some(node) = self.selected_node() {
+            if node.pending || node.skip_reason.is_some() {
+                Err("Pending or excluded entries cannot be moved to Trash. Select a scanned file or folder.".into())
+            } else {
+                deletion::prepare(
+                    &self.current_path().join(&node.name),
+                    &self.root_path,
+                    node.size,
+                    node.errors > 0,
+                )
+            }
+        } else {
+            Err("Select a file or folder first.".into())
+        };
+        self.trash_index = self.order.get(self.selected_index).copied();
+        self.trash_dialog = Some(match result {
+            Ok(candidate) => TrashDialog::Confirm(candidate),
+            Err(message) => TrashDialog::Notice(message),
+        });
+        self.trash_dialog_scroll = 0;
+        self.trash_dialog_max_scroll = 0;
+        self.trash_confirmation_visible = false;
+    }
+
+    pub fn take_trash_request(&mut self) -> Option<TrashCandidate> {
+        self.trash_request.take()
+    }
+
+    pub fn finish_trash(&mut self, result: Result<(), String>) {
+        self.trashing = false;
+        match result {
+            Ok(()) => {
+                let row = self.selected_index;
+                if let (Some(root), Some(index)) = (&mut self.root, self.trash_index.take()) {
+                    fn remove(
+                        node: &mut FileNode,
+                        path: &[usize],
+                        index: usize,
+                    ) -> Option<(u64, u64)> {
+                        let removed = if let Some((&child, tail)) = path.split_first() {
+                            remove(node.children.get_mut(child)?, tail, index)?
+                        } else {
+                            if index >= node.children.len() {
+                                return None;
+                            }
+                            let deleted = node.children.remove(index);
+                            (deleted.size, deleted.errors)
+                        };
+                        node.size = node.size.saturating_sub(removed.0);
+                        node.errors = node.errors.saturating_sub(removed.1);
+                        Some(removed)
+                    }
+                    remove(root, &self.path, index);
+                }
+                self.reorder(None);
+                self.selected_index = row.min(self.order.len().saturating_sub(1));
+                self.totals_stale = true;
+                self.trash_status = Some("Moved to Trash · Restore in Finder · R rescans sizes · Disk space may be unchanged until Trash is emptied".into());
+            }
+            Err(message) => {
+                self.trash_index = None;
+                self.trash_dialog = Some(TrashDialog::Notice(message));
+                self.trash_dialog_scroll = 0;
+                self.trash_status = Some("Move to Trash failed; results retained".into());
+            }
+        }
+    }
+
+    pub fn take_rescan_request(&mut self) -> bool {
+        std::mem::take(&mut self.rescan_requested)
+    }
+
+    pub fn reset_for_rescan(&mut self) {
+        let root_path = self.root_path.clone();
+        *self = Self::new(root_path);
+        self.trash_status = Some("Rescanning from the original root…".into());
+    }
+
     /// Returns true only for an explicit quit command. Help captures navigation.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
@@ -127,7 +245,55 @@ impl App {
             return false;
         }
         if key.code == KeyCode::Char('q') {
-            return true;
+            return !self.trashing;
+        }
+        if self.trashing {
+            return false;
+        }
+        if self.trash_dialog.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.trash_dialog = None;
+                    self.trash_index = None;
+                }
+                KeyCode::Enter if matches!(self.trash_dialog, Some(TrashDialog::Notice(_))) => {
+                    self.trash_dialog = None;
+                    self.trash_index = None;
+                }
+                // Return and repeated keys never confirm deletion. The warning must
+                // have been rendered through its final line before y becomes active.
+                KeyCode::Char('y')
+                    if key.kind == KeyEventKind::Press && self.trash_confirmation_visible =>
+                {
+                    if let Some(TrashDialog::Confirm(candidate)) = self.trash_dialog.take() {
+                        self.trash_request = Some(candidate);
+                        self.trashing = true;
+                        self.trash_status = Some("Moving selected item to Trash…".into());
+                    }
+                }
+                KeyCode::Down => {
+                    self.trash_dialog_scroll = self
+                        .trash_dialog_scroll
+                        .saturating_add(1)
+                        .min(self.trash_dialog_max_scroll)
+                }
+                KeyCode::Up => {
+                    self.trash_dialog_scroll = self.trash_dialog_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => {
+                    self.trash_dialog_scroll = self
+                        .trash_dialog_scroll
+                        .saturating_add(5)
+                        .min(self.trash_dialog_max_scroll)
+                }
+                KeyCode::PageUp => {
+                    self.trash_dialog_scroll = self.trash_dialog_scroll.saturating_sub(5)
+                }
+                KeyCode::Home => self.trash_dialog_scroll = 0,
+                KeyCode::End => self.trash_dialog_scroll = self.trash_dialog_max_scroll,
+                _ => {}
+            }
+            return false;
         }
         if matches!(key.code, KeyCode::Char('?') | KeyCode::F(1)) {
             self.show_help = !self.show_help;
@@ -169,6 +335,10 @@ impl App {
             KeyCode::End => self.selected_index = self.order.len().saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.drill_down(),
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => self.go_up(),
+            KeyCode::Char('d') | KeyCode::Delete if key.kind == KeyEventKind::Press => {
+                self.request_trash()
+            }
+            KeyCode::Char('R') if !self.scanning => self.rescan_requested = true,
             KeyCode::Char('r') if self.can_go_up() => {
                 let child = self.path[0];
                 self.scroll = self.parent_scrolls[0];
@@ -415,5 +585,108 @@ mod keyboard_tests {
         let mut release = key(KeyCode::Char('q'));
         release.kind = KeyEventKind::Release;
         assert!(!app.handle_key(release));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod trash_tests {
+    use super::*;
+    use crate::deletion::tests::Fixture;
+
+    pub(crate) fn fixture_app() -> (Fixture, App) {
+        let fixture = Fixture::new();
+        let folder = fixture.0.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("old.txt"), b"old").unwrap();
+        std::fs::write(folder.join("keep.txt"), b"keep").unwrap();
+        let mut branch = FileNode::new("folder".into(), 7, true);
+        branch.pending = false;
+        branch.children = vec![
+            FileNode::new("old.txt".into(), 3, false),
+            FileNode::new("keep.txt".into(), 4, false),
+        ];
+        let mut root = FileNode::new("root".into(), 7, true);
+        root.children.push(branch);
+        let mut app = App::new(fixture.0.clone());
+        app.apply(ScanEvent::Started(root));
+        app.apply(ScanEvent::Finished);
+        app.refresh();
+        app.drill_down();
+        app.selected_index = app.order.iter().position(|&i| i == 0).unwrap();
+        (fixture, app)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn cancel_return_repeat_and_unread_warning_never_request_deletion() {
+        let (_fixture, mut app) = fixture_app();
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(app.trash_dialog, Some(TrashDialog::Confirm(_))));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.take_trash_request().is_none());
+        app.trash_confirmation_visible = true;
+        let mut repeat = key(KeyCode::Char('y'));
+        repeat.kind = KeyEventKind::Repeat;
+        app.handle_key(repeat);
+        assert!(app.take_trash_request().is_none());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.trash_dialog.is_none());
+        assert!(app.current_path().join("old.txt").exists());
+        app.scanning = true;
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(app.trash_dialog, Some(TrashDialog::Notice(_))));
+        app.trash_confirmation_visible = true;
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.take_trash_request().is_none());
+    }
+
+    #[test]
+    fn confirmed_result_updates_ancestors_without_losing_current_location() {
+        let (fixture, mut app) = fixture_app();
+        app.handle_key(key(KeyCode::Delete));
+        app.trash_confirmation_visible = true;
+        app.handle_key(key(KeyCode::Char('y')));
+        let candidate = app.take_trash_request().unwrap();
+        assert!(app.trashing);
+        // Simulate a successful recoverable move entirely inside the test fixture.
+        std::fs::rename(&candidate.path, fixture.0.join("simulated-trash")).unwrap();
+        app.handle_key(key(KeyCode::Left));
+        assert!(
+            app.can_go_up(),
+            "navigation is held until the result is applied"
+        );
+        app.finish_trash(Ok(()));
+        assert!(!app.trashing);
+        assert!(app.can_go_up());
+        assert_eq!(app.root.as_ref().unwrap().size, 4);
+        assert_eq!(app.current_node().unwrap().size, 4);
+        assert_eq!(app.current_node().unwrap().children.len(), 1);
+        assert_eq!(app.selected_node().unwrap().name, "keep.txt");
+        assert!(app.totals_stale);
+        app.handle_key(key(KeyCode::Char('R')));
+        assert!(app.take_rescan_request());
+        app.reset_for_rescan();
+        assert!(app.scanning && !app.totals_stale);
+        assert!(!app.can_go_up());
+    }
+
+    #[test]
+    fn failed_operation_keeps_tree_and_explains_error() {
+        let (_fixture, mut app) = fixture_app();
+        app.handle_key(key(KeyCode::Char('d')));
+        app.trash_confirmation_visible = true;
+        app.handle_key(key(KeyCode::Char('y')));
+        app.take_trash_request().unwrap();
+        app.finish_trash(Err("Permission denied".into()));
+        assert_eq!(app.root.as_ref().unwrap().size, 7);
+        assert_eq!(app.current_node().unwrap().children.len(), 2);
+        assert!(!app.totals_stale);
+        assert!(
+            matches!(&app.trash_dialog, Some(TrashDialog::Notice(message)) if message.contains("Permission denied"))
+        );
     }
 }
