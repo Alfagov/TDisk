@@ -29,6 +29,7 @@ fn panel(title: impl Into<Line<'static>>) -> Block<'static> {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App, progress: &Progress) {
+    app.update_progress(progress);
     app.refresh();
     let area = f.area();
     f.render_widget(
@@ -43,7 +44,11 @@ pub fn draw(f: &mut Frame, app: &mut App, progress: &Progress) {
     let footer = panel(" Commands ");
     f.render_widget(Paragraph::new(commands).block(footer), sections[1]);
     let body = Layout::vertical([
-        Constraint::Length(if sections[0].height >= 10 { 4 } else { 0 }),
+        Constraint::Length(if sections[0].height >= 10 {
+            if app.volume_usage.is_some() { 5 } else { 4 }
+        } else {
+            0
+        }),
         Constraint::Min(0),
         Constraint::Length(if sections[0].height >= 7 { 1 } else { 0 }),
     ])
@@ -83,13 +88,13 @@ fn draw_header(f: &mut Frame, app: &App, progress: &Progress, area: Rect) {
             "READY",
             ACCENT,
             format!(
-                "{} allocated · {} items",
+                "{} file allocation · {} items",
                 format_size(node.map_or(0, |n| n.size)),
                 app.order.len()
             ),
         )
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 format!(" {label} "),
@@ -105,6 +110,21 @@ fn draw_header(f: &mut Frame, app: &App, progress: &Progress, area: Rect) {
             Style::default().fg(TEXT),
         )),
     ];
+    if let Some(usage) = &app.volume_usage {
+        lines.insert(
+            1,
+            Line::from(vec![
+                Span::styled(" Volume ", Style::default().fg(ACCENT).bold()),
+                Span::raw(format!(
+                    "{} used / {} total · {} available · {}",
+                    format_size(usage.used),
+                    format_size(usage.total),
+                    format_size(usage.available),
+                    usage.mount.display()
+                )),
+            ]),
+        );
+    }
     f.render_widget(
         Paragraph::new(lines).block(panel(Line::from(vec![
             Span::styled(" TDisk ", Style::default().fg(ACCENT).bold()),
@@ -143,6 +163,13 @@ fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let message = if let Some(error) = &app.error {
             format!("Unable to scan\n{error}\n\nPress q to quit, or ? for help.")
+        } else if let Some(node) = app.current_node()
+            && let Some(reason) = node.skip_reason
+        {
+            format!(
+                "Not included: {}.\nChoose that volume as the scan root to scan it separately.\n\n{back_hint}",
+                reason.label()
+            )
         } else if app.current_node().is_some_and(|node| node.errors > 0) {
             format!("Folder could not be fully read.\nThe size shown is incomplete.\n\n{back_hint}")
         } else if app.current_node().is_some_and(|node| node.pending) || app.root.is_none() {
@@ -211,8 +238,14 @@ fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
                 }),
             )];
             if show_size {
-                let size = if child.pending {
-                    "scanning…".into()
+                let size = if let Some(reason) = child.skip_reason {
+                    fit_name(reason.label(), 12).trim_end().to_string()
+                } else if child.pending {
+                    if child.size > 0 {
+                        format!("≥{}", format_size(child.size))
+                    } else {
+                        "scanning…".into()
+                    }
                 } else if child.errors > 0 {
                     format!("{}*", format_size(child.size))
                 } else {
@@ -228,8 +261,13 @@ fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
             if detailed {
-                if child.pending {
-                    spans.push(Span::styled("  size pending", Style::default().fg(MUTED)));
+                if child.skip_reason.is_some() {
+                    spans.push(Span::styled(
+                        "  excluded from total",
+                        Style::default().fg(MUTED),
+                    ));
+                } else if child.pending {
+                    spans.push(Span::styled("  scanning…", Style::default().fg(MUTED)));
                 } else {
                     let percent = if node.size > 0 {
                         child.size as f64 / node.size as f64 * 100.0
@@ -268,6 +306,14 @@ fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_selection(f: &mut Frame, app: &App, area: Rect) {
     let text = if let Some(error) = &app.error {
         format!(" Scan error · {error}")
+    } else if let Some(node) = app.selected_node()
+        && let Some(reason) = node.skip_reason
+    {
+        format!(
+            " {} · {} · excluded from total",
+            node.name.to_string_lossy(),
+            reason.label()
+        )
     } else if let Some(node) = app.current_node()
         && node.errors > 0
     {
@@ -278,7 +324,7 @@ fn draw_selection(f: &mut Frame, app: &App, area: Rect) {
     } else if let Some(node) = app.selected_node() {
         let kind = if node.is_dir { "Folder" } else { "File" };
         let detail = if node.pending {
-            "size pending".to_string()
+            format!("at least {} · scanning", format_size(node.size))
         } else {
             format!("{} on disk", format_size(node.size))
         };
@@ -398,7 +444,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     lines.extend([
         Line::default(),
         Line::from("Folders end with /. Files are not opened."),
-        Line::from("scanning… = pending   * = incomplete size"),
+        Line::from("≥ = still scanning   * = incomplete size"),
         Line::from("Sizes update while you browse."),
         Line::default(),
         Line::from(Span::styled(
@@ -548,6 +594,40 @@ mod tests {
                 .unwrap();
             assert!(screen(&terminal).contains("quits"));
         }
+    }
+
+    #[test]
+    fn immediate_volume_usage_partial_folders_and_exclusions_are_distinct() {
+        let mut app = fixture_app();
+        app.apply(ScanEvent::VolumeUsage(crate::filesystem::VolumeUsage {
+            mount: "/System/Volumes/Data".into(),
+            used: 900_000_000_000,
+            total: 1_000_000_000_000,
+            available: 100_000_000_000,
+        }));
+        let progress = Progress::default();
+        progress
+            .root_sizes
+            .set(vec![
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(42_000_000),
+            ])
+            .unwrap();
+        let mut excluded = FileNode::new("Data".into(), 0, true);
+        excluded.pending = false;
+        excluded.skip_reason = Some(crate::scan_context::SkipReason::MountedVolume);
+        app.root.as_mut().unwrap().children.push(excluded);
+        let mut terminal = Terminal::new(TestBackend::new(140, 26)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &progress))
+            .unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("900.0 GB used"));
+        assert!(text.contains("≥42.0 MB"));
+        assert!(text.contains("other volume"));
+        assert!(text.contains("excluded from total"));
     }
 
     // Optional buffer export lets visual QA inspect exactly what Ratatui rendered.

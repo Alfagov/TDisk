@@ -2,6 +2,7 @@ mod app;
 mod filesystem;
 #[cfg(target_os = "macos")]
 mod fs_mac;
+mod scan_context;
 mod ui;
 
 use filesystem::{Progress, ScanEvent};
@@ -102,6 +103,7 @@ fn benchmark_scan(path: PathBuf) -> io::Result<()> {
     let mut finished = false;
     for event in rx {
         match &event {
+            ScanEvent::VolumeUsage(_) => {}
             ScanEvent::Started(_) => first = Some(start.elapsed()),
             ScanEvent::Directory { .. } => {
                 first_directory.get_or_insert_with(|| start.elapsed());

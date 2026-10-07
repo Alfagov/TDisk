@@ -1,9 +1,11 @@
-use crate::filesystem::{FileNode, ScanEvent};
+use crate::filesystem::{FileNode, Progress, ScanEvent, VolumeUsage};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 pub struct App {
     pub root: Option<FileNode>,
+    pub volume_usage: Option<VolumeUsage>,
     path: Vec<usize>,
     parent_scrolls: Vec<usize>,
     pub root_path: PathBuf,
@@ -23,6 +25,7 @@ impl App {
     pub fn new(root_path: PathBuf) -> Self {
         Self {
             root: None,
+            volume_usage: None,
             path: Vec::new(),
             parent_scrolls: Vec::new(),
             root_path,
@@ -41,13 +44,14 @@ impl App {
 
     pub fn apply(&mut self, event: ScanEvent) {
         match event {
+            ScanEvent::VolumeUsage(usage) => self.volume_usage = Some(usage),
             ScanEvent::Started(root) => {
                 self.root = Some(root);
                 self.view_dirty = true;
             }
             ScanEvent::Directory { index, node } => {
                 if let Some(root) = &mut self.root {
-                    root.size += node.size;
+                    root.size = root.size - root.children[index].size + node.size;
                     root.errors += node.errors;
                     root.children[index] = node;
                     self.view_dirty |= self.path.is_empty() || self.path.first() == Some(&index);
@@ -63,6 +67,26 @@ impl App {
                 self.scanning = false;
                 self.error = Some(message);
             }
+        }
+    }
+
+    pub fn update_progress(&mut self, progress: &Progress) {
+        if !self.scanning {
+            return;
+        }
+        if let Some(sizes) = progress.root_sizes.get()
+            && let Some(root) = &mut self.root
+        {
+            let mut changed = false;
+            for (child, size) in root.children.iter_mut().zip(sizes) {
+                if child.pending {
+                    let size = size.load(Ordering::Relaxed);
+                    changed |= child.size != size;
+                    child.size = size;
+                }
+            }
+            root.size = root.children.iter().map(|child| child.size).sum();
+            self.view_dirty |= changed && self.path.is_empty();
         }
     }
 
@@ -254,6 +278,45 @@ mod tests {
         assert_eq!(app.order[app.selected_index], 1);
         app.previous();
         assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn partial_folder_sizes_are_visible_before_completion_and_not_added_twice() {
+        let mut root = FileNode::new("root".into(), 5, true);
+        root.children = vec![
+            FileNode::new("folder".into(), 0, true),
+            FileNode::new("file".into(), 5, false),
+        ];
+        let mut app = App::new("root".into());
+        app.apply(ScanEvent::Started(root));
+        app.refresh();
+        let progress = Progress::default();
+        progress
+            .root_sizes
+            .set(vec![
+                std::sync::atomic::AtomicU64::new(10),
+                std::sync::atomic::AtomicU64::new(5),
+            ])
+            .unwrap();
+        app.update_progress(&progress);
+        app.refresh();
+        assert_eq!(app.root.as_ref().unwrap().size, 15);
+        assert_eq!(app.root.as_ref().unwrap().children[0].size, 10);
+        assert!(app.root.as_ref().unwrap().children[0].pending);
+        progress.root_sizes.get().unwrap()[0].store(20, Ordering::Relaxed);
+        app.update_progress(&progress);
+        assert_eq!(app.root.as_ref().unwrap().size, 25);
+        let mut finished = FileNode::new("folder".into(), 30, true);
+        finished.pending = false;
+        app.apply(ScanEvent::Directory {
+            index: 0,
+            node: finished,
+        });
+        app.update_progress(&progress);
+        assert_eq!(app.root.as_ref().unwrap().size, 35);
+        app.apply(ScanEvent::Finished);
+        app.update_progress(&progress);
+        assert_eq!(app.root.as_ref().unwrap().size, 35);
     }
 
     #[test]
