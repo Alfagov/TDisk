@@ -209,7 +209,8 @@ impl Session {
                 }
             }
         }
-        if let Some(root) = &mut self.root
+        if !self.stale
+            && let Some(root) = &mut self.root
             && let Some(sizes) = self.progress.root_sizes.get()
         {
             for (child, size) in root.children.iter_mut().zip(sizes) {
@@ -520,5 +521,118 @@ pub unsafe extern "C" fn tdisk_scan_issues(handle: *mut std::ffi::c_void) -> *mu
 pub unsafe extern "C" fn tdisk_string_free(value: *mut c_char) {
     if !value.is_null() {
         drop(unsafe { CString::from_raw(value) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deletion::tests::Fixture;
+    fn completed(path: &Path) -> Session {
+        let mut session = Session::new(path.into());
+        for _ in 0..1000 {
+            session.drain();
+            if session.status != "scanning" {
+                return session;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("fixture scan did not finish");
+    }
+    #[test]
+    fn snapshots_keep_stable_ids_and_return_only_the_requested_folder() {
+        let fixture = Fixture::new();
+        let folder = fixture.0.join("Library – 日本語");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("inside.txt"), b"contents").unwrap();
+        std::fs::write(fixture.0.join("outside.txt"), b"outside").unwrap();
+        let mut session = completed(&fixture.0);
+        let root = session.snapshot("", 0);
+        let rows = root.children.unwrap();
+        assert_eq!(rows.len(), 2);
+        let directory = rows.iter().find(|r| r.is_directory).unwrap();
+        assert_eq!(
+            decode_path(&directory.id),
+            Some(std::fs::canonicalize(&folder).unwrap())
+        );
+        let unchanged = session.snapshot("", root.listing_revision);
+        assert!(unchanged.children.is_none());
+        let nested = session.snapshot(&directory.id, 0);
+        assert_eq!(nested.children.unwrap()[0].name, "inside.txt");
+        assert_eq!(nested.breadcrumbs.len(), 2);
+        assert!(
+            session
+                .snapshot(&directory.id, nested.listing_revision)
+                .children
+                .is_none()
+        );
+    }
+    #[test]
+    fn preparing_trash_is_non_destructive_and_protects_the_scan_root() {
+        let fixture = Fixture::new();
+        let file = fixture.0.join("keep.txt");
+        std::fs::write(&file, b"keep").unwrap();
+        let mut session = completed(&fixture.0);
+        let root = session.snapshot("", 0);
+        assert_eq!(session.prepare_trash(&root.root_id)["ok"], false);
+        let id = &root.children.unwrap()[0].id;
+        assert_eq!(session.prepare_trash(id)["ok"], true);
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        assert!(session.prepare_trash("bad identifier")["error"].is_string());
+        assert!(session.prepared.is_none());
+    }
+    #[test]
+    fn cancellation_finishes_with_partial_status() {
+        let fixture = Fixture::new();
+        let mut session = Session::new(fixture.0.clone());
+        session.progress.cancelled.store(true, Ordering::Relaxed);
+        for _ in 0..1000 {
+            session.drain();
+            if session.status != "scanning" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(session.status, "stopped");
+        assert!(session.error.is_none());
+    }
+    #[test]
+    #[ignore = "Moves only a generated bridge fixture to native macOS Trash"]
+    fn native_trash_refreshes_only_the_confirmed_row_and_ancestors() {
+        let fixture = Fixture::new();
+        let removed = fixture.0.join(format!(
+            "tdisk-native-disposable-{}.txt",
+            std::process::id()
+        ));
+        let retained = fixture.0.join("retained.txt");
+        std::fs::write(&removed, b"disposable bridge fixture").unwrap();
+        std::fs::write(&retained, b"retained bridge fixture").unwrap();
+        let mut session = completed(&fixture.0);
+        let before = session.snapshot("", 0);
+        let rows = before.children.unwrap();
+        let target = rows
+            .iter()
+            .find(|row| row.path == std::fs::canonicalize(&removed).unwrap().to_string_lossy())
+            .unwrap();
+        assert_eq!(session.prepare_trash(&target.id)["ok"], true);
+        let reply = session.trash();
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert!(!removed.exists());
+        assert!(retained.exists());
+        let after = session.snapshot("", before.listing_revision);
+        assert!(after.totals_stale);
+        assert_eq!(after.children.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            after.folder.unwrap().size,
+            before.folder.unwrap().size - target.size
+        );
+        assert!(session.trash()["error"].is_string());
+    }
+    #[test]
+    fn path_identifiers_preserve_non_utf8_bytes() {
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/a\xff".to_vec()));
+        assert_eq!(decode_path(&encode_path(&path)), Some(path));
+        assert!(decode_path("z0").is_none());
+        assert!(decode_path("0").is_none());
     }
 }

@@ -22,3 +22,9 @@ objc2 = "0.6.4"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Keep build-time procedural macros loadable with macOS 27's dyld alignment checks.
+# This does not change optimization of the shipping static library.
+[profile.release.build-override]
+debug = true
+strip = "none"

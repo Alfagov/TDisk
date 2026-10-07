@@ -1,6 +1,8 @@
 # TDisk
 
-A keyboard-driven disk-usage browser. Folder sizes arrive progressively while the scan runs.
+A disk-usage browser for macOS, with a native SwiftUI app and a keyboard-driven TUI. Folder sizes arrive progressively while the scan runs.
+
+Open `TDiskMac/TDiskMac.xcodeproj`, select the **TDiskMac** scheme and **My Mac**, then press **⌘R**. Xcode builds the optimized Rust scanner automatically. See [macOS app setup and architecture](TDiskMac/README.md).
 
 ```sh
 cargo run --release -- /path/to/directory
@@ -39,7 +41,7 @@ The app rechecks the selected item's filesystem identity, scan boundaries, prote
 
 Successful moves remove the row and update its ancestor allocations. Remaining sizes are labeled as a snapshot because hard-link attribution and external changes may require a new scan. Press **R** to rebuild sizes from the original root; this returns navigation to the root. Volume usage is refreshed independently and is never reduced by an assumed amount “freed.” Move to Trash is currently unavailable on other operating systems.
 
-The [macOS design](design/TDisk-macOS-design.md) specifies the matching native UI flow. The Xcode starter has not been implemented.
+The native app implements the [macOS design](design/TDisk-macOS-design.md), with a locations sidebar, sortable folder table, inspector, scan cancellation, native menus and confirmed Move to Trash. **⌘⌫** opens the warning; Escape cancels. The confirmation button must be explicitly activated, and Return alone never confirms.
 
 Folders end with `/`. Files are displayed for inspection and are not opened. The selected row has both a highlight and a `›` marker. The item counter shows your position in the list. `scanning…` means a folder size is pending; `≥` shows the allocated bytes found so far while scanning continues; `*` marks an incomplete size. Percentages use the currently known total and may change during scanning.
 

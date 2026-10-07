@@ -1,1 +1,7 @@
 /target
+
+# Local Xcode build products and per-user editor state.
+/TDiskMac/build/
+/TDiskMac/DerivedData/
+**/xcuserdata/
+*.xcuserstate
