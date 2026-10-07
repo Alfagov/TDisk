@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileIdentity {
@@ -54,6 +55,7 @@ impl SeenObjects {
 }
 
 pub struct ScanContext {
+    cancelled: Arc<AtomicBool>,
     root: PathBuf,
     excluded_mounts: HashSet<PathBuf>,
     allowed_devices: HashSet<u64>,
@@ -89,12 +91,22 @@ impl ScanContext {
             allowed_devices.insert(FileIdentity::from_metadata(&metadata).device);
         }
         Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
             root: root.to_path_buf(),
             excluded_mounts,
             allowed_devices,
             directories: SeenObjects::default(),
             hard_links: SeenObjects::default(),
         }
+    }
+
+    pub fn with_cancellation(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = cancelled;
+        self
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
     }
 
     pub fn directory_skip(&self, path: &Path) -> Option<SkipReason> {

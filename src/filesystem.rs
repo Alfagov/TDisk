@@ -3,9 +3,9 @@ use rayon::prelude::*;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug)]
 pub struct FileNode {
@@ -34,6 +34,7 @@ impl FileNode {
 
 #[derive(Default)]
 pub struct Progress {
+    pub cancelled: Arc<AtomicBool>,
     pub files: AtomicU64,
     pub directories: AtomicU64,
     pub bytes: AtomicU64,
@@ -59,13 +60,17 @@ pub enum ScanEvent {
 /// Directory records stay in discovery order, so updates and navigation use stable indices.
 /// Only directories are scheduled in Rayon; regular files need no additional I/O on macOS.
 pub fn scan(path: PathBuf, tx: &Sender<ScanEvent>, progress: &Progress) {
+    if progress.cancelled.load(Ordering::Relaxed) {
+        let _ = tx.send(ScanEvent::Finished);
+        return;
+    }
     let setup = (|| -> io::Result<_> {
         let path = std::fs::canonicalize(&path)?;
         #[cfg(target_os = "macos")]
         if let Ok(usage) = crate::fs_mac::volume_usage(&path) {
             let _ = tx.send(ScanEvent::VolumeUsage(usage));
         }
-        let context = ScanContext::new(&path)?;
+        let context = ScanContext::new(&path)?.with_cancellation(Arc::clone(&progress.cancelled));
         let root = read_node(&path, progress, &context, None)?;
         Ok((path, context, root))
     })();
@@ -94,12 +99,17 @@ pub fn scan(path: PathBuf, tx: &Sender<ScanEvent>, progress: &Progress) {
         return;
     }
     let scan_child = |(index, path): (usize, PathBuf)| {
-        let node = scan_directory(
+        let mut node = scan_directory(
             &path,
             progress,
             &context,
             progress.root_sizes.get().and_then(|sizes| sizes.get(index)),
         );
+        if node.pending
+            && let Some(size) = progress.root_sizes.get().and_then(|sizes| sizes.get(index))
+        {
+            node.size = size.load(Ordering::Relaxed);
+        }
         let _ = tx.send(ScanEvent::Directory { index, node });
     };
     if directories.len() <= 1 {
@@ -116,12 +126,15 @@ fn scan_directory(
     context: &ScanContext,
     branch: Option<&AtomicU64>,
 ) -> FileNode {
+    if progress.cancelled.load(Ordering::Relaxed) {
+        return FileNode::new(node_name(path), 0, true);
+    }
     let mut node = match read_node(path, progress, context, branch) {
         Ok(node) => node,
         Err(_) => {
             let mut node = FileNode::new(node_name(path), 0, true);
-            node.errors = 1;
-            node.pending = false;
+            node.pending = progress.cancelled.load(Ordering::Relaxed);
+            node.errors = u64::from(!node.pending);
             return node;
         }
     };
@@ -141,7 +154,7 @@ fn scan_directory(
     }
     node.size = node.children.iter().map(|child| child.size).sum();
     node.errors += node.children.iter().map(|child| child.errors).sum::<u64>();
-    node.pending = false;
+    node.pending = progress.cancelled.load(Ordering::Relaxed);
     node
 }
 
@@ -237,6 +250,9 @@ fn read_directory_portable(
     let mut children = Vec::new();
     let mut errors = 0;
     for entry in std::fs::read_dir(path)? {
+        if context.is_some_and(ScanContext::is_cancelled) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "scan stopped"));
+        }
         let result = (|| -> io::Result<()> {
             let entry = entry?;
             let kind = entry.file_type()?;

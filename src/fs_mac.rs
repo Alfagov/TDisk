@@ -53,6 +53,9 @@ pub fn read_directory(
         let mut children = Vec::new();
         let mut errors = 0;
         loop {
+            if context.is_some_and(ScanContext::is_cancelled) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "scan stopped"));
+            }
             // SAFETY: fd is an open directory; attrs and the aligned buffer remain
             // valid for the call, with the exact writable buffer size supplied.
             let count = unsafe {

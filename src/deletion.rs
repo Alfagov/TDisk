@@ -11,12 +11,22 @@ pub struct TrashCandidate {
     identity: FileIdentity,
 }
 
-// The folder containers are protected; ordinary contents of Documents/Downloads/etc.
-// remain eligible. System and application-support trees are protected recursively.
-const SYSTEM_TREES: &[&str] = &[
+// Protect the directory containers themselves, not everything below them. Ordinary
+// contents of Library and other system locations remain eligible; macOS permissions
+// still decide whether the native Trash operation can succeed.
+const SYSTEM_CONTAINERS: &[&str] = &[
     "/System",
+    "/System/Library",
+    "/System/Applications",
+    "/System/Volumes",
     "/Library",
     "/usr",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/share",
+    "/usr/local",
     "/bin",
     "/sbin",
     "/dev",
@@ -24,6 +34,7 @@ const SYSTEM_TREES: &[&str] = &[
     "/var",
     "/private/etc",
     "/private/var",
+    "/private/var/db",
 ];
 const ROOT_CONTAINERS: &[&str] = &[
     "/",
@@ -48,6 +59,7 @@ const HOME_CONTAINERS: &[&str] = &[
     "Movies",
     "Public",
     "Applications",
+    "Library",
 ];
 
 fn logical_path(path: &Path) -> PathBuf {
@@ -62,7 +74,7 @@ fn logical_path(path: &Path) -> PathBuf {
     }
 }
 
-fn protection_reason(
+pub(crate) fn protection_reason(
     path: &Path,
     root: &Path,
     home: Option<&Path>,
@@ -81,9 +93,9 @@ fn protection_reason(
     if ROOT_CONTAINERS
         .iter()
         .any(|item| path == logical_path(Path::new(item)))
-        || SYSTEM_TREES
+        || SYSTEM_CONTAINERS
             .iter()
-            .any(|item| path.starts_with(logical_path(Path::new(item))))
+            .any(|item| path == logical_path(Path::new(item)))
     {
         return Some("This system location is protected by TDisk.");
     }
@@ -113,9 +125,6 @@ fn protection_reason(
                 "Home folders and standard user folders are protected. Select an ordinary item inside instead.",
             );
         }
-        if path.starts_with(home.join("library")) {
-            return Some("User Library and Trash contents are protected by TDisk.");
-        }
     }
     None
 }
@@ -129,7 +138,7 @@ pub fn prepare(
 ) -> Result<TrashCandidate, String> {
     // Obtain a fresh mount inventory at both confirmation and execution. Fail closed.
     let mounts = crate::fs_mac::mount_points().map_err(|error| error.to_string())?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").and_then(|home| std::fs::canonicalize(home).ok());
     prepare_with(path, root, size, incomplete, home.as_deref(), &mounts)
 }
 
@@ -275,17 +284,19 @@ pub(crate) mod tests {
             "/Users/other",
             "/Users/alex/Downloads",
             "/Users/other/Pictures",
-            "/Users/alex/Library/Caches",
+            "/Users/alex/Library",
             "/System/Volumes/Data/Users/alex/Documents",
             "/System/Volumes/Data/Library",
+            "/Library",
             "/System/Library",
             "/usr/local",
+            "/usr/bin",
             "/Applications",
             "/private/var/db",
             "/Volumes/Disk",
             "/work/with-mount",
             "/users/ALEx/downloads",
-            "/SYSTEM/volumes/data/users/Alex/library/caches",
+            "/SYSTEM/volumes/data/users/Alex/library",
             "/Volumes/dISK",
             "/Volumes/Disk/.Trashes/501/item",
         ] {
@@ -309,6 +320,16 @@ pub(crate) mod tests {
             "/System/Volumes/Data/Users/alex/Downloads/old.zip",
             "/Users/alex/Library-old",
             "/work/with-mountain",
+            "/Library/Caches/old-cache",
+            "/Library/Application Support/UnusedApp",
+            "/Library/Logs/old.log",
+            "/Users/alex/Library/Caches",
+            "/Users/alex/Library/Application Support/UnusedApp",
+            "/SYSTEM/volumes/data/users/Alex/library/caches",
+            "/System/Volumes/Data/Library/Caches/old-cache",
+            "/System/Library/unused-file",
+            "/usr/local/unused-package",
+            "/private/var/db/unused-file",
         ] {
             assert!(
                 protection_reason(
@@ -349,6 +370,20 @@ pub(crate) mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn library_contents_are_eligible_but_library_container_is_protected() {
+        let fixture = Fixture::new();
+        let home = std::fs::canonicalize(&fixture.0).unwrap();
+        let library = home.join("Library");
+        let cache = library.join("Caches/UnusedApp");
+        std::fs::create_dir_all(&cache).unwrap();
+        let file = cache.join("old.cache");
+        std::fs::write(&file, b"disposable cache fixture").unwrap();
+        assert!(prepare_with(&library, &home, 0, false, Some(&home), &[]).is_err());
+        assert!(prepare_with(&cache, &home, 0, false, Some(&home), &[]).is_ok());
+        assert!(prepare_with(&file, &home, 0, false, Some(&home), &[]).is_ok());
     }
 
     #[test]
